@@ -20,9 +20,89 @@ import time
 import sqlite3
 import json
 import re
+from multiprocessing.dummy import Pool, Lock
+import threading
+from functools import partial
+from itertools import cycle
 
 import pandas as pd
 from googletrans import Translator
+
+
+class Proxy(object):
+    (READY, BUSY, ERROR) = (0, 1, -1)
+    status = READY
+    last_used = 0
+    errors = 0
+    proxies = None
+
+    def __init__(self, id, lock, proxies=None):
+        self.id = id
+        self.lock = lock
+        self.proxies = proxies
+
+    def is_ready(self, guardtime=5):
+        now = time.time()
+        with self.lock:
+            if self.status == Proxy.READY:
+                if now - self.last_used > guardtime:
+                    return True
+            elif self.status == Proxy.ERROR:
+                if now - self.last_used > 600:
+                    return True
+        return False
+
+    def set_busy(self):
+        with self.lock:
+            self.status = Proxy.BUSY
+            self.last_used = time.time()
+
+    def set_ready(self):
+        with self.lock:
+            self.status = Proxy.READY
+            self.errors = 0
+
+    def set_error(self):
+        with self.lock:
+            self.errors += 1
+            if self.errors > 3:
+                self.status = Proxy.ERROR
+            else:
+                self.status = Proxy.READY
+
+
+class RateLimitProxies(object):
+    def __init__(self, filename=None, rate_limit=10):
+        self.lock = Lock()
+        self.proxies = cycle(self.get_proxies(filename))
+        self.guardtime = 60.0 / rate_limit
+
+    def get_proxies(self, filename):
+        p = [None]
+        if filename:
+            with open(filename) as f:
+                for l in f:
+                    l = l.strip()
+                    if l != '' and not l.startswith('#'):
+                        p.append({'http': l, 'https': l})
+        proxies = []
+        for i, e in enumerate(p):
+            proxy = Proxy(i, self.lock, e)
+            proxies.append(proxy)
+        return proxies
+
+    def get_free_proxy(self, timeout=None):
+        start = time.time()
+        while True:
+            proxy = next(self.proxies)
+            if proxy.is_ready(self.guardtime):
+                proxy.set_busy()
+                return proxy
+            now = time.time()
+            if timeout:
+                if now - start > timeout:
+                    return None
+            time.sleep(1)
 
 
 def isEnglish(s):
@@ -61,73 +141,57 @@ def dict_factory(cursor, row):
     return d
 
 
-def bulk_words_translation(args, words):
+def thread_translation(args, w):
+    tid = threading.current_thread().ident
     try:
-        conn = sqlite3.connect(args.word_info_file, isolation_level=None)
-        conn.text_factory = str
-        conn.row_factory = dict_factory
-        c = conn.cursor()
-        # Create table
-        c.execute('''CREATE TABLE IF NOT EXISTS words
-                    (word text, input_lang text, output_lang text, translate text,
-                    extra_data text)''')
-
-        trans_dict = {}
-
-        translator = Translator()
-        count = 1
-        for w in words:
-            print("Translating ({:d}/{:d})...".format(count, len(words)))
+        c = args.cursor
+        with args.db_lock:
             c.execute('SELECT translate, extra_data FROM words WHERE word=?'
-                      ' and output_lang=?', (w, args.output_language))
+                        ' and output_lang=?', (w, args.output_language))
             data = c.fetchone()
-            if data is None:
-                retry = 0
-                while True:
-                    try:
-                        print("- Google Translate AJAX API request...")
-                        if args.input_language is None:
-                            trans = translator.translate(w, dest=args.output_language)
-                            extra_data = trans.extra_data
-                            text = trans.text
-                            input_language = extra_data.get('original-language', None)
-                        else:
-                            trans = translator.translate(w, src=args.input_language,
-                                                        dest=args.output_language)
-                            extra_data = trans.extra_data
-                            text = trans.text
-                            input_language = args.input_language
-                        time.sleep(60.0 / args.rate_limit)
-                        # Insert a row of data
+        if data is None:
+            while True:
+                try:
+                    proxy = args.proxies.get_free_proxy()
+                    if proxy is None:
+                        print("WARN: No free proxy...")
+                        time.sleep(5)
+                        continue
+                    print("- API request...(tid={:d}, pid={:d})".format(tid, proxy.id))
+                    translator = Translator(proxies=proxy.proxies, timeout=5)
+                    if args.input_language is None:
+                        trans = translator.translate(w, dest=args.output_language)
+                        extra_data = trans.extra_data
+                        text = trans.text
+                        input_language = extra_data.get('original-language', None)
+                    else:
+                        trans = translator.translate(w, src=args.input_language,
+                                                    dest=args.output_language)
+                        extra_data = trans.extra_data
+                        text = trans.text
+                        input_language = args.input_language
+                    # Insert a row of data
+                    with args.db_lock:
                         c.execute("INSERT INTO words VALUES (?, ?, ?, ?, ?)",
-                                (w, input_language, args.output_language,
+                                    (w, input_language, args.output_language,
                                     text, json.dumps(extra_data)))
-                        # Save (commit) the changes
-                        #conn.commit()
-                        data = {'translate': text,
-                                'extra_data': extra_data}
-                        break
-                    except Exception as e:
-                        print('ERROR: {!s}'.format(e))
-                        retry += 1
-                        if retry > 5:
-                            print("ERROR: Too many retries, please try again later.")
-                            sys.exit(-1)
-                        print("Wait 30s and retry...({:d})".format(retry))
-                        time.sleep(30)
-                        
-            else:
-                print("- Found in word info database...")
-                #print(w, data['translate'])
-            trans_dict[w] = data
-            count += 1
-        # We can also close the connection if we are done with it.
-        # Just be sure any changes have been committed or they will be lost.
+                    # Save (commit) the changes
+                    #conn.commit()
+                    data = {'translate': text,
+                            'extra_data': extra_data}
+                    proxy.set_ready()
+                    break
+                except Exception as e:
+                    print('ERROR (tid={:d}, pid={:d}): {!s}'.format(tid, proxy.id, e))
+                    proxy.set_error()
+        else:
+            #print("- Found in word info database...(tid={:d})".format(tid))
+            #print(w, data['translate'])
+            pass
     except Exception as e:
-        print('ERROR: {!s}'.format(e))
-    finally:
-        conn.close()
-    return trans_dict
+        print('ERROR: {!s} (tid={:d})'.format(e, tid))
+
+    return data
 
 
 def get_translate(trans_dict, text):
@@ -181,7 +245,35 @@ def build_cell_trans_dict(cell_values, words_dict):
 def main(args):
     df = pd.read_csv(args.inputfile)
     unique_cells, unique_words = get_non_eng_unique_values(df)
-    words_dict = bulk_words_translation(args, unique_words)
+
+    args.db_lock = Lock()
+
+    args.proxies = RateLimitProxies(args.proxies, args.rate_limit)
+
+    pool = Pool(args.threads)
+
+    try:
+        conn = sqlite3.connect(args.word_info_file, isolation_level=None, check_same_thread=False)
+        conn.text_factory = str
+        conn.row_factory = dict_factory
+        c = conn.cursor()
+        # Create table
+        c.execute('''CREATE TABLE IF NOT EXISTS words
+                    (word text, input_lang text, output_lang text, translate text,
+                    extra_data text)''')
+        args.cursor = c
+        thread_func = partial(thread_translation, args)
+        results = pool.map(thread_func, unique_words)
+        words_dict = {}
+        for i, u in enumerate(unique_words):
+            words_dict[u] = results[i]
+    except Exception as e:
+        print('ERROR: {!s}'.format(e))
+    finally:
+        pool.close()
+        pool.join()
+        conn.close()
+
     trans_dict = build_cell_trans_dict(unique_cells, words_dict)
     winfo_cols = pd.read_csv(args.word_info_columns)
     for col in df.columns:
@@ -210,8 +302,12 @@ if __name__ == '__main__':
                         help='Input language (Default auto detect)')
     parser.add_argument('-l', '--output-language', default='en',
                         help='Output language (Default English)')
-    parser.add_argument('-r', '--rate-limit', type=int, default=15,
+    parser.add_argument('-r', '--rate-limit', type=int, default=10,
                         help='Google API requests per MINUTE')
+    parser.add_argument('-t', '--threads', type=int, default=1,
+                        help='Number of threads (Default: 1)')
+    parser.add_argument('-p', '--proxies', default=None,
+                        help='Proxies list file')
     parser.add_argument('-w', '--word-info-file', default='word_info.db',
                         help='Word info data file')
     parser.add_argument('-c', '--word-info-columns',
