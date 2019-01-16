@@ -36,15 +36,16 @@ The [script](table_translator.py) takes the following options:
 
 ```
 usage: table_translator.py [-h] [-i INPUT_LANGUAGE] [-l OUTPUT_LANGUAGE]
-                           [-r RATE_LIMIT] [-w WORD_INFO_FILE]
-                           [-c WORD_INFO_COLUMNS] [-o OUTPUT]
+                           [-r RATE_LIMIT] [-t THREADS] [-p PROXIES]
+                           [-w WORD_INFO_FILE] [-c WORD_INFO_COLUMNS]
+                           [-o OUTPUT]
                            inputfile
 
 Table Translator: Translate Unique Non-English Words in a Table and
    Append Their Translations
 
 Use GoogleTrans, a Python client for the free and unlimited Google Translate
-Ajax API, to get word-level translations for each unique word and then append
+Ajax API, to get word level translations for each unique word and then append
 translated cell values to the table in columns with column names.
 
 Example usage:
@@ -61,6 +62,10 @@ optional arguments:
                         Output language (Default English)
   -r RATE_LIMIT, --rate-limit RATE_LIMIT
                         Google API requests per MINUTE
+  -t THREADS, --threads THREADS
+                        Number of threads (Default: 1)
+  -p PROXIES, --proxies PROXIES
+                        Proxies list file
   -w WORD_INFO_FILE, --word-info-file WORD_INFO_FILE
                         Word info data file
   -c WORD_INFO_COLUMNS, --word-info-columns WORD_INFO_COLUMNS
